@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 # Copyright (C) 2016 Nicola Corna <nicola@corna.info>
+# Copyright (C) 2016 Damien Zammit <damien@zamaudio.com>
 #
 # me_cleaner is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -25,13 +26,15 @@ def fill_range(f, start, end, fill):
     block = fill * 4096
     f.seek(start, 0)
     f.writelines(itertools.repeat(block, (end - start) // 4096))
-    f.write(fill[:(end - start) % 4096])
+    f.write(block[:(end - start) % 4096])
 
 
-def remove_module(f, mod_header, ftpr_offset, lzma_start_rel, lzma_end_rel):
+def remove_module(f, mod_header, ftpr_offset, lzma_start_rel, lzma_end_rel, chunk_start, chunks, huff_start, llut, llut_addrbase):
     name = mod_header[0x04:0x14].decode("ascii")
     start = unpack("<I", mod_header[0x38:0x3C])[0]
+    llut_start = unpack("<I", mod_header[0x3C:0x40])[0]
     size = unpack("<I", mod_header[0x40:0x44])[0]
+    load_base = unpack("<I", mod_header[0x4C:0x50])[0]
     flags = unpack("<I", mod_header[0x50:0x54])[0]
     comp_type = (flags >> 4) & 7
 
@@ -47,10 +50,37 @@ def remove_module(f, mod_header, ftpr_offset, lzma_start_rel, lzma_end_rel):
                   .format(name, start, start+size, lzma_start_rel,
                           lzma_end_rel))
     elif comp_type == 0x01:
-        print(" {:<16}: removal of Huffman modules is not supported yet, "
-              "skipping".format(name))
+        pos = load_base
+        endpos = pos + size
+        huff_begin = huff_start
+        first = 1
+        firstnonempty = 0
+        hstart = 0
+        print(" {:<16}: Wiping Huffman chunks:".format(name))
+        i = 0
+        while (i < chunks):
+            i = (pos - (llut_addrbase + 0x10000000)) // 0x400
+            chunkseek = chunk_start + i*4
+            f.seek(chunkseek, 0)
+            huff = unpack("<I", f.read(4))[0]
+            if ((huff & 0xfe000000) != 0x80000000) and (first == 1):
+                firstnonempty = i * 0x400
+                first = 0
+                hstart = huff & 0x01ffffff
+            elif ((huff & 0xfe000000) == 0x80000000):
+                break
+            huff = huff & 0x01ffffff
+            f.seek(chunkseek, 0)
+            f.write(pack("<I", huff))
+            pos += 0x400
+            f.seek(huff, 0)
+            fill_range(f, huff, huff + 0x400, b"\xff")
+            print(" {:<16}: Wiped Huffman chunk: (0x{:0X} - 0x{:0X})".format(name, huff, huff + 0x400))
+        return huff + chunks*0x400, chunks*0x400
     else:
         print(" {:<16}: unknown compression, skipping".format(name))
+
+    return huff_start, size
 
 if len(sys.argv) != 2 or sys.argv[1] == "-h" or sys.argv[1] == "--help":
     print("Usage: me_cleaner.py me_image.bin")
@@ -128,8 +158,11 @@ else:
                             size = unpack("<I", f.read(4))[0]
                             llut_start = ftpr_offset + (size * 4 + 0x3f) & ~0x3f
 
+                            f.seek(llut_start + 0x4, 0)
+                            chunks, llut_addrbase = unpack("<II", f.read(8))
                             f.seek(llut_start + 0x10, 0)
-                            huff_start, huff_size = unpack("<II", f.read(8))
+                            huff_size, huff_start = unpack("<II", f.read(8))
+                            chunk_start = llut_start + 0x40
                             lzma_start = huff_start + huff_size
 
                             print("Wiping LZMA section (0x{:0X} - 0x{:0X})"
@@ -138,13 +171,18 @@ else:
                             fill_range(f, lzma_start,
                                        ftpr_offset + ftpr_lenght, b"\xff")
 
+                            huff_total = 0
                             f.seek(llut_start, 0)
                             if f.read(4) == b"LLUT":
                                 for mod_header in mod_hs:
-                                    remove_module(f, mod_header, ftpr_offset,
-                                                  lzma_start - ftpr_offset,
-                                                  ftpr_lenght)
-
+                                    huff_start, s = remove_module(f,
+                                                    mod_header, ftpr_offset,
+                                                    lzma_start - ftpr_offset,
+                                                    ftpr_lenght,
+                                                    chunk_start, chunks,
+                                                    huff_start,
+                                                    llut_start,
+                                                    llut_addrbase)
                             else:
                                 print("Can't find the LLUT region in the FTPR "
                                       "partition")
